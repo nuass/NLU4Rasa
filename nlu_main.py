@@ -1,8 +1,8 @@
 #! -*- coding:utf-8 -*-
 # bert+crf 级联方法，一阶段识别BIO，二阶段识别对应的分类
-# 参考博客：https://zhuanlan.zhihu.com/p/166496466
-# 数据集：http://s3.bmio.net/kashgari/china-people-daily-ner-corpus.tar.gz
-# [valid_f1]  token_level: 98.11； entity_level: 96.23
+# 参考博客：https://github.com/Tongjilibo/bert4torch/blob/master/examples/sequence_labeling/task_sequence_labeling_ner_cascade_crf.py
+# 三阶段  根据以上代码 添加意图识别
+# 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-5a65605b-a87b-8833-9064-e4904fd979da"
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
@@ -25,10 +25,7 @@ from bert4torch.callbacks import AdversarialTraining
 
 maxlen = 256
 batch_size = 16
-#categories = ['LOC', 'PER', 'ORG']
-#entity_categories = ['adjust', 'theme', 'multiples','device_address','search','map_address','roam']
-#entity_categories = ['adjust', 'theme', 'multiples','device_address','search','map_address','roam']
-#print(entity_categories)
+
 # BERT base
 config_path = './chinese_L-12_H-768_A-12/bert4torch_config.json'
 checkpoint_path = './chinese_L-12_H-768_A-12/pytorch_model.bin'
@@ -105,13 +102,7 @@ class RASADataset(ListDataset):
                     add_labels = [i for i in extracted_texts if i not in entity_labels]
                     entity_labels.extend(add_labels)
         return (intent_labels,entity_labels)
-    '''
-    regex = r"\((.*?)\)"
 
-    # 使用正则表达式提取文本
-    extracted_texts = [re.findall(regex, text) for text in texts]
-
-    '''
 
     def load_data(self,filename):
         data=[]
@@ -147,7 +138,7 @@ def collate_fn(batch):
         end_mapping = {j[-1]: i for i, j in enumerate(mapping) if j}
         token_ids = tokenizer.tokens_to_ids(tokens)
         labels = np.zeros(len(token_ids))
-        entity_ids, entity_labels = [], [] #如'北大街街道打开',entity_labels为[4, 1] 分别为device_address和adjust
+        entity_ids, entity_labels = [], [] #
         for start, end, label in d[2:]:
             if start in start_mapping and end in end_mapping:
                 start = start_mapping[start]
@@ -162,12 +153,11 @@ def collate_fn(batch):
             entity_labels.append(0)
 
         batch_token_ids.append(token_ids)
-        batch_labels.append(labels)#batch_labels '北大街街道打开' 标注为Bi的位置 [0. 1. 2. 2. 2. 2. 1. 2. 0.]
+        batch_labels.append(labels)#batch_labels 
         batch_entity_ids.append(entity_ids)
         batch_entity_labels.append(entity_labels)
 
         intent_label=d[1]
-        #print(4567,intent_label,intents_categories.index(intent_label)+1) # 这是一种错误的写法，pytorch要求label必须是0到n的连续整数
         intent_label_ids.append([intents_categories.index(intent_label)])
 
     batch_token_ids = torch.tensor(sequence_padding(batch_token_ids), dtype=torch.long, device=device)
@@ -190,7 +180,6 @@ class Model(BaseModel):
     def __init__(self):
         super().__init__()
         self.bert = build_transformer_model(config_path=config_path, checkpoint_path=checkpoint_path, segment_vocab_size=0, with_pool=True)
-        #self.bert = build_transformer_model(config_path=config_path, checkpoint_path=checkpoint_path, segment_vocab_size=0)
         self.dense1 = nn.Linear(768, len(entity_categories))
         self.dense2 = nn.Linear(768, len(entity_categories)+1)  # 包含padding
         self.crf = CRF(len(entity_categories))
@@ -199,7 +188,7 @@ class Model(BaseModel):
         self.dense3 = nn.Linear(self.bert.configs['hidden_size'], len(intents_categories))
 
     def forward(self, *inputs):
-        # 一阶段的输出
+        # 实体识别一阶段的输出
         token_ids, entity_ids = inputs[0], inputs[1]
         last_hidden_state, pooled_output = self.bert([token_ids])  # [btz, seq_len, hdsz]
         output = self.dropout(pooled_output)
@@ -207,15 +196,14 @@ class Model(BaseModel):
         emission_score = self.dense1(last_hidden_state)  # [bts, seq_len, tag_size]
         attention_mask = token_ids.gt(0)
 
-        # 二阶段输出
+        # 实体识别阶段输出
         btz, entity_count, _ = entity_ids.shape
         hidden_size = last_hidden_state.shape[-1]
         entity_ids = entity_ids.reshape(btz, -1, 1).repeat(1, 1, hidden_size)
         entity_states = torch.gather(last_hidden_state, dim=1, index=entity_ids).reshape(btz, entity_count, -1, hidden_size)
         entity_states = torch.mean(entity_states, dim=2)  # 取实体首尾hidden_states的均值
         entity_logit = self.dense2(entity_states)  # [btz, 实体个数，实体类型数]
-        #output1 = last_hidden_state[:, 0]
-
+        # 意图识别输出
         output = self.dense3(output)
 
 
@@ -225,12 +213,11 @@ class Model(BaseModel):
         self.eval()
         with torch.no_grad():
             # 一阶段推理
-            #last_hidden_state,_ = self.bert([token_ids])  # [btz, seq_len, hdsz]
+
             last_hidden_state, pooled_output = self.bert([token_ids])  # [btz, seq_len, hdsz]
             output = self.dropout(pooled_output)
             output = self.dense3(output)
             intent_pred = torch.argmax(output, dim=-1) 
-            #print(123456789,intent_pred)
 
             emission_score = self.dense1(last_hidden_state)  # [bts, seq_len, tag_size]
             attention_mask = token_ids.gt(0)
@@ -253,7 +240,7 @@ class Model(BaseModel):
                     entity_ids.append([0, 0])  # 如果没有则用0填充
                 batch_entity_ids.append([i for i in entity_ids if i])
             batch_entity_ids = torch.tensor(sequence_padding(batch_entity_ids), dtype=torch.long, device=device)  # [btz, 实体个数，start/end]
-            
+
             btz, entity_count, _ = batch_entity_ids.shape
             hidden_size = last_hidden_state.shape[-1]
             gather_index = batch_entity_ids.reshape(btz, -1, 1).repeat(1, 1, hidden_size)
@@ -279,7 +266,7 @@ class Loss(nn.Module):
         emission_score, attention_mask, entity_logit,intent_logit = outputs
 
         seq_labels, entity_labels,intent_labels = labels
-
+        # loss1 loss2 均来自与实体阶段损失
         loss1 = model.crf(emission_score, attention_mask, seq_labels)
         loss2 = self.loss2(entity_logit.reshape(-1, entity_logit.shape[-1]), entity_labels.flatten())
         # 新增意图
@@ -293,7 +280,7 @@ model.compile(loss=Loss(), optimizer=optim.Adam(model.parameters(), lr=2e-5))
 def evaluate(data):
     X1, Y1, Z1 = 1e-10, 1e-10, 1e-10
     X2, Y2, Z2 = 1e-10, 1e-10, 1e-10
-    accuracy=0
+
     intentLabels =[]
     intentPreds = []
     for (token_ids, entity_ids), (label, entity_labels,intent_labels) in tqdm(data):
@@ -344,7 +331,7 @@ class Evaluator(Callback):
         if (f2+intgent_f1)/2 > self.best_val_f1:
             self.best_val_f1 = (f2+intgent_f1)/2
             model.save_weights('./result/best_model.pt')
-        #print(f'[val-1阶段] f1: {f1:.5f}, p: {precision:.5f} r: {recall:.5f}')
+
         print(f'[实体识别阶段] f1: {f2:.5f}, p: {precision2:.5f} r: {recall2:.5f}\n')
         print(f'[意图识别阶段] f1: {intgent_f1:.5f}, acc: {intent_acc:.5f}\n')
         print(f'[整体均值] best_f1: {self.best_val_f1:.5f}\n')
@@ -357,7 +344,7 @@ if __name__ == '__main__' and 'train' in sys.argv:
     model.fit(train_dataloader, epochs=20, steps_per_epoch=None, callbacks=[evaluator,adversarial_train])
 
 else:
-    #intents_categories = ['camera_move', 'screen_fold', 'camera_open', 'general_search', 'map_control', 'roam_control', 'switch_theme']
+
     test = "打开车窗"
     model.load_weights('./result/best_model.pt')
     tokens = tokenizer.tokenize(test, maxlen=maxlen)
@@ -370,7 +357,7 @@ else:
 
     intent_pred = intents_categories[intent_pred.tolist()[0]]
     entities=[]
-    #print(entity_pred)
+
     for e in entity_pred:
         entities.append({"entity":test[e[1]-1:e[2]],"type":entity_categories[e[3]-1]})
     print(intent_pred,entities)
