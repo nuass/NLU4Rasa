@@ -4,7 +4,6 @@
 # 三阶段  根据以上代码 添加意图识别
 # 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-5a65605b-a87b-8833-9064-e4904fd979da"
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import numpy as np
 import torch
@@ -123,7 +122,7 @@ class RASADataset(ListDataset):
         return data
 
 intents_categories,entity_categories = RASADataset(file_path='./data/auto_instructions.yml').intent_entity_labels
-print(intents_categories,entity_categories)
+
 # 建立分词器
 tokenizer = Tokenizer(dict_path, do_lower_case=True)
 
@@ -131,7 +130,7 @@ def collate_fn(batch):
     batch_token_ids, batch_labels, batch_entity_ids, batch_entity_labels = [], [], [], []
     intent_label_ids = []
     for d in batch:
-        print(11111111111,d)
+
         tokens = tokenizer.tokenize(d[0], maxlen=maxlen)
         mapping = tokenizer.rematch(d[0], tokens)
         start_mapping = {j[0]: i for i, j in enumerate(mapping) if j}
@@ -170,8 +169,7 @@ def collate_fn(batch):
     return [batch_token_ids, batch_entity_ids], [batch_labels, batch_entity_labels,intent_label_ids]
 
 # 转换数据集
-#train_dataloader = DataLoader(MyDataset('./data/example.train'), batch_size=batch_size, shuffle=True, collate_fn=collate_fn) 
-#train_dataloader = DataLoader(MyDataset('./data/example.train'), batch_size=batch_size, shuffle=True, collate_fn=collate_fn) 
+
 train_dataloader = DataLoader(RASADataset('./data/auto_instructions.yml'), batch_size=batch_size, shuffle=True,collate_fn=collate_fn) 
 valid_dataloader = DataLoader(RASADataset('./data/auto_instructions.yml'), batch_size=batch_size, collate_fn=collate_fn) 
 
@@ -304,7 +302,7 @@ def evaluate(data):
     # 意图指标
     intent_f1 = f1_score(intentLabels, intentPreds, average='macro')
 
-    f1, precision, recall = 2 * X1 / (Y1 + Z1), X1 / Y1, X1 / Z1
+    #f1, precision, recall = 2 * X1 / (Y1 + Z1), X1 / Y1, X1 / Z1
     f2, precision2, recall2 = 2 * X2 / (Y2 + Z2), X2/ Y2, X2 / Z2
 
     return  f2, precision2, recall2,intent_accuracy,intent_f1
