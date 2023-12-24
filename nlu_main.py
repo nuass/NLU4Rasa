@@ -1,8 +1,7 @@
 #! -*- coding:utf-8 -*-
-# bert+crf 级联方法，一阶段识别BIO，二阶段识别对应的分类
-# 参考博客：https://github.com/Tongjilibo/bert4torch/blob/master/examples/sequence_labeling/task_sequence_labeling_ner_cascade_crf.py
-# 三阶段  根据以上代码 添加意图识别
-# 
+# bert+ poolout+softmax 意图分类
+# bert+crf 实体识别：先识别BIO，再识别对应的分类
+
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import numpy as np
@@ -10,17 +9,18 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
-from bert4torch.callbacks import Callback
+from bert4torch.models import build_transformer_model, BaseModel
+from bert4torch.tokenizers import Tokenizer
 from bert4torch.snippets import sequence_padding, ListDataset, seed_everything, get_pool_emb
 from bert4torch.layers import CRF
-from bert4torch.tokenizers import Tokenizer
-from bert4torch.models import build_transformer_model, BaseModel
+from bert4torch.callbacks import Callback,AdversarialTraining
+
 from tqdm import tqdm
 import yaml
 import re
 from sklearn.metrics import accuracy_score, precision_score,f1_score
 import sys
-from bert4torch.callbacks import AdversarialTraining
+import torch.nn.functional as F
 
 maxlen = 256
 batch_size = 16
@@ -30,58 +30,30 @@ config_path = './chinese_L-12_H-768_A-12/bert4torch_config.json'
 checkpoint_path = './chinese_L-12_H-768_A-12/pytorch_model.bin'
 dict_path = './chinese_L-12_H-768_A-12/vocab.txt'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+dataset= './data/auto_instructions.yml'
 
 # 固定seed
 seed_everything(42)
 
-# 加载数据集
-class MyDataset(ListDataset):
-    @staticmethod
-    def load_data(filename):
-        D = []
-        with open(filename, encoding='utf-8') as f:
-            f = f.read()
-            for l in f.split('\n\n'):
-                if not l:
-                    continue
-                d = ['']
-                for i, c in enumerate(l.split('\n')):
-                    char, flag = c.split(' ')
-                    d[0] += char
-                    if flag[0] == 'B':
-                        d.append([i, i, flag[2:]])
-                    elif flag[0] == 'I':
-                        d[-1][1] = i
-                D.append(d)
-        return D
-
-
 class RASADataset(ListDataset):
     def __init__(self, file_path=None, data=None, **kwargs):
         self.intent_entity_labels =self.get_labels(file_path)
-
         super().__init__(file_path, data, **kwargs)
-    def extract_and_concatenate(self,text):
-        # 使用正则表达式匹配并提取括号外的文本
-        matches = re.findall(r'\[([^]]+)\]', text)
-        # 拼接提取出的文本片段
-        result = ''.join(matches)
-        return result
 
-    def extract_entities(self,intent,text):
+    def extract_entities(self, intent, text):
         # 使用正则表达式匹配文本中的实体和类型
         pattern = r'\[([^\]]+)\]\(([^)]+)\)'
         entities = re.findall(pattern, text)
-        results = []
-        offset = 0
-        text = self.extract_and_concatenate(text)
+        results,offset = [],0
+        for e in entities:
+            text = text.replace("(" + e[1] + ")", '').replace("[", '').replace("]", '').replace("\n", '')
         for entity in entities:
             start = text.find(entity[0], offset)
             end = start + len(entity[0])
             results.append([start, end - 1, entity[1]])
             offset = end
 
-        return [text]+[intent]+results
+        return [text] + [intent] + results
 
     def get_labels(self,filename):
         intent_labels=[]
@@ -102,26 +74,23 @@ class RASADataset(ListDataset):
                     entity_labels.extend(add_labels)
         return (intent_labels,entity_labels)
 
-
-    def load_data(self,filename):
-        data=[]
+    def load_data(self, filename):
+        data = []
         with open(filename, 'r') as file:
             parsed_yaml = yaml.safe_load(file)
             for item in parsed_yaml["nlu"]:
-                if "intent"  in item:
+                if "intent" in item:
                     intent = item["intent"].split("/")[1]
                     examples = item["examples"].split("- ")
                     for example in examples:
-                        if example.strip()=='':continue
-                        matches =self.extract_entities(intent,example)
-                        data.append(list(matches)) 
-                if "lookup" in item:
-                    lookup = item["lookup"]
-                    examples = item["examples"].split("- ")
-                
+                        if example.strip() == '': continue
+                        matches = self.extract_entities(intent, example)
+                        data.append(list(matches))
+
         return data
 
-intents_categories,entity_categories = RASADataset(file_path='./data/auto_instructions.yml').intent_entity_labels
+
+intents_categories,entity_categories = RASADataset(file_path=dataset).intent_entity_labels
 
 # 建立分词器
 tokenizer = Tokenizer(dict_path, do_lower_case=True)
@@ -178,20 +147,26 @@ class Model(BaseModel):
     def __init__(self):
         super().__init__()
         self.bert = build_transformer_model(config_path=config_path, checkpoint_path=checkpoint_path, segment_vocab_size=0, with_pool=True)
-        self.dense1 = nn.Linear(768, len(entity_categories))
-        self.dense2 = nn.Linear(768, len(entity_categories)+1)  # 包含padding
+        # 意图分类参数
+        self.dense4intent = nn.Linear(self.bert.configs['hidden_size'], len(intents_categories))
+        # 实体参数
+        self.dense4crf = nn.Linear(768, len(entity_categories))
+        self.dense4entity = nn.Linear(768, len(entity_categories)+1)  # 包含padding
         self.crf = CRF(len(entity_categories))
 
         self.dropout = nn.Dropout(0.1)
-        self.dense3 = nn.Linear(self.bert.configs['hidden_size'], len(intents_categories))
 
     def forward(self, *inputs):
-        # 实体识别一阶段的输出
         token_ids, entity_ids = inputs[0], inputs[1]
         last_hidden_state, pooled_output = self.bert([token_ids])  # [btz, seq_len, hdsz]
         output = self.dropout(pooled_output)
 
-        emission_score = self.dense1(last_hidden_state)  # [bts, seq_len, tag_size]
+        # 意图分类输出
+        output = self.dense4intent(output)
+
+        # 实体识别一阶段的输出
+
+        emission_score = self.dense4crf(last_hidden_state)  # [bts, seq_len, tag_size]
         attention_mask = token_ids.gt(0)
 
         # 实体识别阶段输出
@@ -200,28 +175,26 @@ class Model(BaseModel):
         entity_ids = entity_ids.reshape(btz, -1, 1).repeat(1, 1, hidden_size)
         entity_states = torch.gather(last_hidden_state, dim=1, index=entity_ids).reshape(btz, entity_count, -1, hidden_size)
         entity_states = torch.mean(entity_states, dim=2)  # 取实体首尾hidden_states的均值
-        entity_logit = self.dense2(entity_states)  # [btz, 实体个数，实体类型数]
-        # 意图识别输出
-        output = self.dense3(output)
-
+        entity_logit = self.dense4entity(entity_states)  # [btz, 实体个数，实体类型数]
 
         return emission_score, attention_mask, entity_logit,output
 
     def predict(self, token_ids):
         self.eval()
         with torch.no_grad():
-            # 一阶段推理
-
             last_hidden_state, pooled_output = self.bert([token_ids])  # [btz, seq_len, hdsz]
-            output = self.dropout(pooled_output)
-            output = self.dense3(output)
-            intent_pred = torch.argmax(output, dim=-1) 
 
-            emission_score = self.dense1(last_hidden_state)  # [bts, seq_len, tag_size]
+            output = self.dense4intent(pooled_output)
+            # 意图（分类）
+            intent_pred = torch.argmax(output, dim=-1) 
+            intent_prob = F.softmax(output, dim=-1)
+            intent_prob, _ = torch.max(intent_prob, dim=-1)
+
+            emission_score = self.dense4crf(last_hidden_state)  # [bts, seq_len, tag_size]
             attention_mask = token_ids.gt(0)
             best_path = self.crf.decode(emission_score, attention_mask)  # [bts, seq_len]
 
-            # 二阶段推理
+            # 实体抽取
             batch_entity_ids = []
             for one_samp in best_path:
                 entity_ids = []
@@ -244,33 +217,39 @@ class Model(BaseModel):
             gather_index = batch_entity_ids.reshape(btz, -1, 1).repeat(1, 1, hidden_size)
             entity_states = torch.gather(last_hidden_state, dim=1, index=gather_index).reshape(btz, entity_count, -1, hidden_size)
             entity_states = torch.mean(entity_states, dim=2)  # 取实体首尾hidden_states的均值
-            entity_logit = self.dense2(entity_states)  # [btz, 实体个数，实体类型数]
+            entity_logit = self.dense4entity(entity_states)  # [btz, 实体个数，实体类型数]
+            entity_prob = F.softmax(entity_logit, dim=-1)
+            entity_prob, _ = torch.max(entity_prob, dim=-1)
+
             entity_pred = torch.argmax(entity_logit, dim=-1)  # [btz, 实体个数]
 
             # 每个元素为一个三元组
             entity_tulpe = trans_entity2tuple(batch_entity_ids, entity_pred)
-        return best_path, entity_tulpe,intent_pred
+
+        return best_path, (intent_pred,intent_prob),(entity_tulpe,entity_prob),
 
 model = Model().to(device)
 
 class Loss(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.loss2 = nn.CrossEntropyLoss(ignore_index=0)
-        # 新增意图
-        self.loss3 = nn.CrossEntropyLoss()
+        # 意图损失
+        self.loss4intent = nn.CrossEntropyLoss()
+
+        self.loss4entity = nn.CrossEntropyLoss(ignore_index=0)
 
     def forward(self, outputs, labels):
         emission_score, attention_mask, entity_logit,intent_logit = outputs
 
         seq_labels, entity_labels,intent_labels = labels
-        # loss1 loss2 均来自与实体阶段损失
-        loss1 = model.crf(emission_score, attention_mask, seq_labels)
-        loss2 = self.loss2(entity_logit.reshape(-1, entity_logit.shape[-1]), entity_labels.flatten())
-        # 新增意图
-        loss3 = self.loss3(intent_logit.reshape(-1, intent_logit.shape[-1]), intent_labels.flatten())
+        # 意图损失
+        loss_i = self.loss4intent(intent_logit.reshape(-1, intent_logit.shape[-1]), intent_labels.flatten())
 
-        return {'loss': (loss1+loss2+loss3)/3, 'loss1': loss1, 'loss2': loss2, 'loss3': loss3}
+        # loss1 loss2 均为实体阶段损失
+        loss_e1 = model.crf(emission_score, attention_mask, seq_labels)
+        loss_e2 = self.loss4entity(entity_logit.reshape(-1, entity_logit.shape[-1]), entity_labels.flatten())
+
+        return {'loss': (loss_e1+loss_e2+loss_i)/3, 'loss_e1': loss_e1, 'loss_e2': loss_e2, 'loss_i': loss_i}
 
 # Loss返回的key会自动计入metrics，下述metrics不写仍可以打印loss1和loss2
 model.compile(loss=Loss(), optimizer=optim.Adam(model.parameters(), lr=2e-5))
@@ -282,20 +261,23 @@ def evaluate(data):
     intentLabels =[]
     intentPreds = []
     for (token_ids, entity_ids), (label, entity_labels,intent_labels) in tqdm(data):
-        scores, entity_pred,intent_pred = model.predict(token_ids)  # [btz, seq_len]
+        scores, (intent_pred,_),(entity_pred,_) = model.predict(token_ids)  # [btz, seq_len]
+
+        # 意图分类统计
+        intentLabels+=intent_labels.flatten().tolist()
+        intentPreds+=intent_pred.tolist()
+
         # 一阶段指标: token粒度
-        attention_mask = label.gt(0)
-        X1 += (scores.eq(label) * attention_mask).sum().item()
-        Y1 += scores.gt(0).sum().item()
-        Z1 += label.gt(0).sum().item()
+        # attention_mask = label.gt(0)
+        # X1 += (scores.eq(label) * attention_mask).sum().item()
+        # Y1 += scores.gt(0).sum().item()
+        # Z1 += label.gt(0).sum().item()
 
         # 二阶段指标：entity粒度
         entity_true = trans_entity2tuple(entity_ids, entity_labels)
         X2 += len(entity_pred.intersection(entity_true))
         Y2 += len(entity_pred)
         Z2 += len(entity_true)
-        intentLabels+=intent_labels.flatten().tolist()
-        intentPreds+=intent_pred.tolist()
 
     intent_accuracy = accuracy_score(intentLabels, intentPreds)
 
@@ -330,8 +312,8 @@ class Evaluator(Callback):
             self.best_val_f1 = (f2+intgent_f1)/2
             model.save_weights('./result/best_model.pt')
 
-        print(f'[实体识别阶段] f1: {f2:.5f}, p: {precision2:.5f} r: {recall2:.5f}\n')
-        print(f'[意图识别阶段] f1: {intgent_f1:.5f}, acc: {intent_acc:.5f}\n')
+        print(f'[实体识别] f1: {f2:.5f}, p: {precision2:.5f} r: {recall2:.5f}\n')
+        print(f'[意图识别] f1: {intgent_f1:.5f}, acc: {intent_acc:.5f}\n')
         print(f'[整体均值] best_f1: {self.best_val_f1:.5f}\n')
 
 
@@ -343,19 +325,24 @@ if __name__ == '__main__' and 'train' in sys.argv:
 
 else:
 
-    test = "打开车窗"
+    print(intents_categories,entity_categories)
+    text = "导航去新浪总部"
     model.load_weights('./result/best_model.pt')
-    tokens = tokenizer.tokenize(test, maxlen=maxlen)
 
-    token_ids = tokenizer.tokens_to_ids(tokens)
+    tokens = tokenizer.tokenize(text, maxlen=maxlen)
 
-    batch_token_ids = torch.tensor(sequence_padding([token_ids]), dtype=torch.long, device=device)
+    token_ids_batch = tokenizer.tokens_to_ids(tokens)
 
-    _, entity_pred,intent_pred = model.predict(batch_token_ids)
+    batch_token_ids = torch.tensor(sequence_padding([token_ids_batch]), dtype=torch.long, device=device)
 
-    intent_pred = intents_categories[intent_pred.tolist()[0]]
+    _,  intent_pred_prob,entity_pred_prob = model.predict(batch_token_ids)
+    # 意图id2label及置信度
+    print("意图：",intents_categories[intent_pred_prob[0]],intent_pred_prob[1].tolist()[0])
+    # 实体id2label及置信度
     entities=[]
+    entity_prob = entity_pred_prob[1].tolist()[0]
 
-    for e in entity_pred:
-        entities.append({"entity":test[e[1]-1:e[2]],"type":entity_categories[e[3]-1]})
-    print(intent_pred,entities)
+    for i,e in enumerate(entity_pred_prob[0]):
+        entities.append({"entity": text[e[1] - 1:e[2]], "type": entity_categories[e[3] - 1],"score":entity_prob[i]})
+    print("实体：",entities)
+
